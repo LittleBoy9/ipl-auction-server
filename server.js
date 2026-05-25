@@ -143,6 +143,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'IPL 2026 Auction Server',
+    serverUrl: `http://${req.headers.host}`,
+    clientUrl: CLIENT_URL,
     players: ipl2026Players.length,
     activeRooms: Object.keys(rooms).length,
     uptime: process.uptime(),
