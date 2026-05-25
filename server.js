@@ -138,6 +138,18 @@ const io = new Server(server, {
 app.use(cors({ origin: CLIENT_URL }));
 app.use(express.json());
 
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'IPL 2026 Auction Server',
+    players: ipl2026Players.length,
+    activeRooms: Object.keys(rooms).length,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
 // In-memory game storage
 const rooms = {};
 
