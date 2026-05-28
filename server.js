@@ -193,16 +193,8 @@ io.on('connection', (socket) => {
     const roomCode = generateRoomCode();
     const roomId = uuidv4();
     
-    // Filter players by selected teams
-    let availablePlayers = ipl2026Players;
-    if (settings.teams && settings.teams.length > 0 && settings.teams.length < 10) {
-      availablePlayers = ipl2026Players.filter(p => settings.teams.includes(p.team));
-    }
-
-    // Limit max players if set
-    if (settings.maxPlayers && settings.maxPlayers < availablePlayers.length) {
-      availablePlayers = shuffleArray(availablePlayers).slice(0, settings.maxPlayers);
-    }
+    // Always use all players - no team filtering
+    const availablePlayers = ipl2026Players;
 
     rooms[roomCode] = {
       id: roomId,
@@ -212,6 +204,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         name: hostName,
         isHost: true,
+        franchise: settings.franchise || null,
         budget: settings.budget || 100,
         team: [],
         spent: 0,
@@ -221,7 +214,6 @@ io.on('connection', (socket) => {
         budget: settings.budget || 100,
         squadSize: settings.squadSize || 11,
         bidTimer: settings.bidTimer || 15,
-        teams: settings.teams || [],
         maxPlayers: settings.maxPlayers || availablePlayers.length
       },
       availablePlayers: shuffleArray(availablePlayers),
@@ -258,11 +250,13 @@ io.on('connection', (socket) => {
       for (let i = 0; i < Math.min(settings.botCount, 9); i++) {
         const botName = getBotName(usedNames);
         usedNames.push(botName);
+        const franchises = ['CSK','MI','RCB','KKR','SRH','DC','PBKS','RR','LSG','GT'];
         rooms[roomCode].players.push({
           id: `bot-${i}-${Date.now()}`,
           name: botName,
           isHost: false,
           isBot: true,
+          franchise: franchises[Math.floor(Math.random() * franchises.length)],
           budget: rooms[roomCode].settings.budget,
           team: [],
           spent: 0,
@@ -276,7 +270,7 @@ io.on('connection', (socket) => {
   });
 
   // Join Room
-  socket.on('join-room', ({ roomCode, playerName }) => {
+  socket.on('join-room', ({ roomCode, playerName, franchise }) => {
     const room = rooms[roomCode];
     if (!room) {
       socket.emit('error', { message: 'Room not found!' });
@@ -313,6 +307,7 @@ io.on('connection', (socket) => {
       name: playerName,
       isHost: false,
       isBot: false,
+      franchise: franchise || null,
       budget: room.settings.budget,
       team: [],
       spent: 0,
@@ -340,11 +335,13 @@ io.on('connection', (socket) => {
     }
     const usedNames = room.players.map(p => p.name);
     const botName = getBotName(usedNames);
+    const franchises = ['CSK','MI','RCB','KKR','SRH','DC','PBKS','RR','LSG','GT'];
     const bot = {
       id: `bot-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
       name: botName,
       isHost: false,
       isBot: true,
+      franchise: franchises[Math.floor(Math.random() * franchises.length)],
       budget: room.settings.budget,
       team: [],
       spent: 0,
@@ -652,6 +649,7 @@ function getRoomState(roomCode) {
       name: p.name,
       isHost: p.isHost,
       isBot: p.isBot || false,
+      franchise: p.franchise || null,
       budget: p.budget,
       team: p.team,
       spent: p.spent,
