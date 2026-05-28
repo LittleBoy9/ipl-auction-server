@@ -128,14 +128,31 @@ const app = express();
 const server = http.createServer(app);
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
+// Allow multiple origins for dev + prod + dev tunnels
+const ALLOWED_ORIGINS = [CLIENT_URL, 'http://localhost:5173', 'http://localhost:3000'];
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc)
+    if (!origin) return callback(null, true);
+    // Check exact match
+    if (ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+    // Allow Dev Tunnels (*.devtunnels.ms) for local testing
+    if (origin && origin.endsWith('.devtunnels.ms')) {
+      return callback(null, true);
+    }
+    console.log('CORS blocked origin:', origin);
+    callback(new Error('Not allowed by CORS'));
+  },
+  methods: ["GET", "POST"]
+};
+
 const io = new Server(server, {
-  cors: {
-    origin: CLIENT_URL,
-    methods: ["GET", "POST"]
-  }
+  cors: corsOptions
 });
 
-app.use(cors({ origin: CLIENT_URL }));
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Health check endpoint
