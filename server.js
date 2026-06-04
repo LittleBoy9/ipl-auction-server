@@ -234,6 +234,9 @@ io.on('connection', (socket) => {
     const squadSize = clampInt(settings.squadSize, 5, 25, 11);
     const bidTimer = clampInt(settings.bidTimer, 3, 60, 15);
     const botCount = clampInt(settings.botCount, 0, 9, 0);
+    // Only accept a franchise that belongs to this sport.
+    const hostFranchiseRaw = cleanStr(settings.franchise, 8);
+    const hostFranchise = sport.franchises.includes(hostFranchiseRaw) ? hostFranchiseRaw : null;
 
     // Honor the requested pool size: shuffle, then take the first N players.
     const poolLimit = settings.maxPlayers && settings.maxPlayers > 0
@@ -249,7 +252,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         name: hostNameClean,
         isHost: true,
-        franchise: cleanStr(settings.franchise, 8) || null,
+        franchise: hostFranchise,
         budget,
         team: [],
         spent: 0,
@@ -316,7 +319,8 @@ io.on('connection', (socket) => {
       return;
     }
     const nameClean = cleanStr(playerName, 20);
-    const franchiseClean = cleanStr(franchise, 8) || null;
+    const frRaw = cleanStr(franchise, 8);
+    const franchiseClean = getSport(room.settings.sport).franchises.includes(frRaw) ? frRaw : null;
     if (!nameClean) {
       socket.emit('error', { message: 'Please enter a valid name.' });
       return;
