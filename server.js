@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { ipl2026Players } = require('./players');
+const { getSport } = require('./sports');
 
 const BOT_NAMES = [
   'Bot-Alpha', 'Bot-Beta', 'Bot-Gamma', 'Bot-Delta', 'Bot-Epsilon',
@@ -18,41 +19,12 @@ function getBotName(usedNames) {
   return `Bot-${Math.floor(Math.random() * 1000)}`;
 }
 
-function calculatePlayerValue(player) {
-  let score = player.basePrice * 10;
-  if (player.battingAvg && player.strikeRate) {
-    score += (player.battingAvg * player.strikeRate) / 50;
-  }
-  if (player.wickets !== null && player.economy) {
-    score += player.wickets * (12 - Math.min(player.economy, 12)) * 2;
-  }
-  if (player.basePrice >= 1.5) score += 15;
-  else if (player.basePrice >= 1.0) score += 10;
-  else if (player.basePrice >= 0.5) score += 5;
-  return score;
-}
-
-function getSquadBalance(team) {
-  const counts = { 'WK-Batter': 0, 'Batter': 0, 'Bowler': 0, 'All-rounder': 0 };
-  team?.forEach(p => { if (counts[p.role] !== undefined) counts[p.role]++; });
-  return {
-    wk: { have: counts['WK-Batter'], need: 1 },
-    batters: { have: counts['Batter'] + counts['WK-Batter'], need: 3 },
-    bowlers: { have: counts['Bowler'], need: 3 },
-    allRounders: { have: counts['All-rounder'], need: 1 },
-  };
-}
-
 function shouldBotBid(bot, player, currentBid, room) {
-  const bal = getSquadBalance(bot.team);
-  const needs = [];
-  if (player.role === 'WK-Batter' && bal.wk.have < bal.wk.need) needs.push('wk');
-  if ((player.role === 'Batter' || player.role === 'WK-Batter') && bal.batters.have < bal.batters.need) needs.push('batter');
-  if (player.role === 'Bowler' && bal.bowlers.have < bal.bowlers.need) needs.push('bowler');
-  if (player.role === 'All-rounder' && bal.allRounders.have < bal.allRounders.need) needs.push('allrounder');
+  const sport = getSport(room.settings.sport);
+  const needed = sport.isNeeded(bot.team, player);
 
-  const value = calculatePlayerValue(player);
-  const needBonus = needs.length > 0 ? 1.5 : 1.0;
+  const value = sport.valuation(player);
+  const needBonus = needed ? 1.5 : 1.0;
   const randomFactor = 0.7 + Math.random() * 0.6;
   const maxPrice = parseFloat((player.basePrice * needBonus * randomFactor * (1 + value / 100)).toFixed(2));
   const cappedMax = Math.min(maxPrice, bot.budget * 0.4);
@@ -61,11 +33,7 @@ function shouldBotBid(bot, player, currentBid, room) {
   if (currentBid >= cappedMax) return { shouldBid: false };
   if (bot.budget <= currentBid) return { shouldBid: false };
 
-  let increment = 0.30;
-  if (currentBid < 0.50) increment = 0.05;
-  else if (currentBid < 1.00) increment = 0.10;
-  else if (currentBid < 5.00) increment = 0.25;
-
+  const increment = sport.increment(currentBid);
   const nextBid = parseFloat((Math.max(currentBid, player.basePrice) + increment).toFixed(2));
   if (nextBid > cappedMax || nextBid > bot.budget) return { shouldBid: false };
 
@@ -94,10 +62,7 @@ function runBotBids(roomCode) {
         const freshResult = shouldBotBid(bot, freshRoom.currentPlayer, freshCurrent, freshRoom);
         if (!freshResult.shouldBid) return;
 
-        let increment = 0.30;
-        if (freshCurrent < 0.50) increment = 0.05;
-        else if (freshCurrent < 1.00) increment = 0.10;
-        else if (freshCurrent < 5.00) increment = 0.25;
+        const increment = getSport(freshRoom.settings.sport).increment(freshCurrent);
         const minBid = parseFloat((freshCurrent + increment).toFixed(2));
         const bidAmount = Math.max(freshResult.amount, minBid);
 
@@ -129,17 +94,21 @@ const server = http.createServer(app);
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 // Allow multiple origins for dev + prod + dev tunnels
-const ALLOWED_ORIGINS = [CLIENT_URL, 'http://localhost:5173', 'http://localhost:3000'];
+const ALLOWED_ORIGINS = [CLIENT_URL];
 const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, curl, etc)
     if (!origin) return callback(null, true);
-    // Check exact match
+    // Configured / production origin
     if (ALLOWED_ORIGINS.includes(origin)) {
       return callback(null, true);
     }
+    // Allow any localhost / 127.0.0.1 port during local dev (5173, 3000, …)
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      return callback(null, true);
+    }
     // Allow Dev Tunnels (*.devtunnels.ms) for local testing
-    if (origin && origin.endsWith('.devtunnels.ms')) {
+    if (origin.endsWith('.devtunnels.ms')) {
       return callback(null, true);
     }
     console.log('CORS blocked origin:', origin);
@@ -185,16 +154,92 @@ function shuffleArray(array) {
   return shuffled;
 }
 
+// ---- Memory safety + abuse guards (tuned for a small single-instance host) --
+const MAX_ROOMS = 80;                  // refuse new rooms past this to avoid OOM
+const HUMAN_GRACE_MS = 2 * 60 * 1000;  // delete a room this long after the last human leaves
+const IDLE_TTL_MS = 30 * 60 * 1000;    // delete a room idle (no activity) this long
+const SWEEP_MS = 60 * 1000;            // how often the janitor runs
+
+// Always clear the per-room timer when removing a room, or its setInterval leaks.
+function destroyRoom(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  clearInterval(room.timerInterval);
+  delete rooms[roomCode];
+}
+
+// Bots are always "connected", so cleanup must count HUMANS, not players.
+function connectedHumans(room) {
+  return room.players.filter(p => p.connected && !p.isBot).length;
+}
+
+function touch(room) {
+  if (room) room.lastActivity = Date.now();
+}
+
+// Per-socket lightweight rate limiter — true if this event arrived too soon.
+function tooFast(socket, key, ms) {
+  socket._rl = socket._rl || {};
+  const now = Date.now();
+  if (socket._rl[key] && now - socket._rl[key] < ms) return true;
+  socket._rl[key] = now;
+  return false;
+}
+
+// Input sanitisers (a tampered client must not be able to send junk).
+function cleanStr(v, max) {
+  return typeof v === 'string' ? v.trim().slice(0, max) : '';
+}
+function clampInt(v, min, max, dflt) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+// Janitor: reclaim abandoned (bots-only / everyone left) and idle rooms + timers.
+setInterval(() => {
+  const now = Date.now();
+  for (const code in rooms) {
+    const room = rooms[code];
+    if (connectedHumans(room) === 0) {
+      room.emptySince = room.emptySince || now;
+      if (now - room.emptySince > HUMAN_GRACE_MS) destroyRoom(code);
+    } else {
+      room.emptySince = null;
+      if (now - (room.lastActivity || now) > IDLE_TTL_MS) destroyRoom(code);
+    }
+  }
+}, SWEEP_MS);
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
   // Create Room
   socket.on('create-room', ({ hostName, settings }) => {
+    if (Object.keys(rooms).length >= MAX_ROOMS) {
+      socket.emit('error', { message: 'Server is busy — too many active rooms. Please try again shortly.' });
+      return;
+    }
+    settings = settings || {};
+    const hostNameClean = cleanStr(hostName, 20) || 'Host';
     const roomCode = generateRoomCode();
     const roomId = uuidv4();
-    
-    // Always use all players - no team filtering
-    const availablePlayers = ipl2026Players;
+
+    // Resolve the chosen sport pack (defaults to cricket).
+    const sport = getSport(settings.sport);
+    const sportPool = sport.players;
+
+    // Sanitise/clamp settings so a tampered client can't set absurd values.
+    const budget = clampInt(settings.budget, 10, 1000, sport.defaultBudget);
+    const squadSize = clampInt(settings.squadSize, 5, 25, 11);
+    const bidTimer = clampInt(settings.bidTimer, 3, 60, 15);
+    const botCount = clampInt(settings.botCount, 0, 9, 0);
+
+    // Honor the requested pool size: shuffle, then take the first N players.
+    const poolLimit = settings.maxPlayers && settings.maxPlayers > 0
+      ? clampInt(settings.maxPlayers, 1, sportPool.length, sportPool.length)
+      : sportPool.length;
+    const availablePlayers = shuffleArray(sportPool).slice(0, poolLimit);
 
     rooms[roomCode] = {
       id: roomId,
@@ -202,37 +247,28 @@ io.on('connection', (socket) => {
       hostId: socket.id,
       players: [{
         id: socket.id,
-        name: hostName,
+        name: hostNameClean,
         isHost: true,
-        franchise: settings.franchise || null,
-        budget: settings.budget || 100,
+        franchise: cleanStr(settings.franchise, 8) || null,
+        budget,
         team: [],
         spent: 0,
         connected: true
       }],
       settings: {
-        budget: settings.budget || 100,
-        squadSize: settings.squadSize || 11,
-        bidTimer: settings.bidTimer || 15,
-        maxPlayers: settings.maxPlayers || availablePlayers.length
+        sport: sport.id,
+        budget,
+        squadSize,
+        bidTimer,
+        maxPlayers: poolLimit
       },
-      availablePlayers: shuffleArray(availablePlayers),
+      availablePlayers: availablePlayers,
       bidHistory: [],
       soldPlayers: [],
       unsoldPlayers: [],
-      allPlayers: availablePlayers.map(p => ({
-        id: p.id,
-        name: p.name,
-        role: p.role,
-        team: p.team,
-        basePrice: p.basePrice,
-        nationality: p.nationality,
-        battingAvg: p.battingAvg,
-        strikeRate: p.strikeRate,
-        economy: p.economy,
-        wickets: p.wickets,
-        status: 'available'
-      })),
+      // Send the full player record so the client can render whichever sport's
+      // stats apply (cricket batting/bowling, football goals/assists, etc.).
+      allPlayers: availablePlayers.map(p => ({ ...p, status: 'available' })),
       currentPlayerIndex: -1,
       currentPlayer: null,
       currentBid: 0,
@@ -240,17 +276,20 @@ io.on('connection', (socket) => {
       status: 'waiting', // waiting, auctioning, paused, ended
       timer: null,
       timerInterval: null,
-      chat: []
+      chat: [],
+      createdAt: Date.now(),
+      lastActivity: Date.now(),
+      emptySince: null
     };
 
     socket.join(roomCode);
     // Add AI bots if requested
-    if (settings.botCount && settings.botCount > 0) {
-      const usedNames = [hostName];
-      for (let i = 0; i < Math.min(settings.botCount, 9); i++) {
+    if (botCount > 0) {
+      const usedNames = [hostNameClean];
+      for (let i = 0; i < botCount; i++) {
         const botName = getBotName(usedNames);
         usedNames.push(botName);
-        const franchises = ['CSK','MI','RCB','KKR','SRH','DC','PBKS','RR','LSG','GT'];
+        const franchises = sport.franchises;
         rooms[roomCode].players.push({
           id: `bot-${i}-${Date.now()}`,
           name: botName,
@@ -271,17 +310,25 @@ io.on('connection', (socket) => {
 
   // Join Room
   socket.on('join-room', ({ roomCode, playerName, franchise }) => {
-    const room = rooms[roomCode];
+    const room = rooms[typeof roomCode === 'string' ? roomCode : ''];
     if (!room) {
       socket.emit('error', { message: 'Room not found!' });
       return;
     }
+    const nameClean = cleanStr(playerName, 20);
+    const franchiseClean = cleanStr(franchise, 8) || null;
+    if (!nameClean) {
+      socket.emit('error', { message: 'Please enter a valid name.' });
+      return;
+    }
 
     // Check if this is a reconnection (same name, previously disconnected)
-    const disconnectedPlayer = room.players.find(p => p.name === playerName && !p.connected);
+    const disconnectedPlayer = room.players.find(p => p.name === nameClean && !p.connected);
     if (disconnectedPlayer) {
       disconnectedPlayer.id = socket.id;
       disconnectedPlayer.connected = true;
+      room.emptySince = null;
+      touch(room);
       socket.join(roomCode);
       socket.emit('joined-room', { roomCode, room: getRoomState(roomCode), playerId: socket.id });
       socket.to(roomCode).emit('player-joined', { player: disconnectedPlayer, room: getRoomState(roomCode) });
@@ -297,17 +344,17 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Room is full (max 10 players)!' });
       return;
     }
-    if (room.players.find(p => p.name === playerName)) {
+    if (room.players.find(p => p.name === nameClean)) {
       socket.emit('error', { message: 'Name already taken in this room!' });
       return;
     }
 
     const newPlayer = {
       id: socket.id,
-      name: playerName,
+      name: nameClean,
       isHost: false,
       isBot: false,
-      franchise: franchise || null,
+      franchise: franchiseClean,
       budget: room.settings.budget,
       team: [],
       spent: 0,
@@ -315,6 +362,8 @@ io.on('connection', (socket) => {
       autoBid: { enabled: false, maxPrice: 0 }
     };
     room.players.push(newPlayer);
+    room.emptySince = null;
+    touch(room);
     socket.join(roomCode);
 
     socket.emit('joined-room', { roomCode, room: getRoomState(roomCode), playerId: socket.id });
@@ -335,7 +384,7 @@ io.on('connection', (socket) => {
     }
     const usedNames = room.players.map(p => p.name);
     const botName = getBotName(usedNames);
-    const franchises = ['CSK','MI','RCB','KKR','SRH','DC','PBKS','RR','LSG','GT'];
+    const franchises = getSport(room.settings.sport).franchises;
     const bot = {
       id: `bot-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
       name: botName,
@@ -379,10 +428,12 @@ io.on('connection', (socket) => {
 
   // Place Bid
   socket.on('place-bid', ({ roomCode, amount }) => {
+    if (tooFast(socket, 'bid', 150)) return; // throttle bid spam
     const room = rooms[roomCode];
     if (!room || room.status !== 'auctioning') return;
     if (!room.currentPlayer) return;
-    
+    if (!Number.isFinite(amount) || amount <= 0) return; // reject junk amounts
+
     const player = room.players.find(p => p.id === socket.id);
     if (!player || !player.connected) return;
 
@@ -392,13 +443,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Calculate minimum bid based on current amount slabs
-    let currentAmount = room.currentBid > 0 ? room.currentBid : room.currentPlayer.basePrice;
-    let increment = 0.30; // default 30L above 5Cr
-    if (currentAmount < 0.50) increment = 0.05;        // below 50L: +5L
-    else if (currentAmount < 1.00) increment = 0.10;   // 50L to 1Cr: +10L
-    else if (currentAmount < 5.00) increment = 0.25;   // 1Cr to 5Cr: +25L
-    
+    // Calculate minimum bid based on the sport's increment slabs
+    const currentAmount = room.currentBid > 0 ? room.currentBid : room.currentPlayer.basePrice;
+    const increment = getSport(room.settings.sport).increment(currentAmount);
     const minBid = parseFloat((currentAmount + increment).toFixed(2));
     if (amount < minBid) {
       socket.emit('error', { message: `Minimum bid is ₹${minBid} Cr` });
@@ -415,7 +462,8 @@ io.on('connection', (socket) => {
 
     room.currentBid = amount;
     room.currentBidder = player.id;
-    
+    touch(room);
+
     // Add to bid history
     room.bidHistory.push({
       playerId: room.currentPlayer.id,
@@ -476,17 +524,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Skip Player (Host only)
-  socket.on('skip-player', ({ roomCode }) => {
-    const room = rooms[roomCode];
-    if (!room || room.hostId !== socket.id) return;
-    if (room.status !== 'auctioning') return;
-
-    clearInterval(room.timerInterval);
-    room.unsoldPlayers.push(room.currentPlayer);
-    moveToNextPlayer(roomCode);
-  });
-
   // Toggle Auto Bid
   socket.on('toggle-auto-bid', ({ roomCode, enabled, maxPrice }) => {
     const room = rooms[roomCode];
@@ -505,35 +542,42 @@ io.on('connection', (socket) => {
 
   // Reaction Emojis
   socket.on('send-reaction', ({ roomCode, emoji }) => {
+    if (tooFast(socket, 'reaction', 300)) return;
     const room = rooms[roomCode];
     if (!room) return;
-    
+
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
+    const emojiClean = cleanStr(emoji, 8);
+    if (!emojiClean) return;
 
     io.to(roomCode).emit('new-reaction', {
       playerName: player.name,
-      emoji,
+      emoji: emojiClean,
       timestamp: Date.now()
     });
   });
 
   // Chat Message
   socket.on('send-chat', ({ roomCode, message }) => {
+    if (tooFast(socket, 'chat', 500)) return;
     const room = rooms[roomCode];
     if (!room) return;
-    
+
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
+    const text = cleanStr(message, 200);
+    if (!text) return;
 
     const chatMsg = {
       id: uuidv4(),
       playerName: player.name,
-      message,
+      message: text,
       timestamp: Date.now()
     };
     room.chat.push(chatMsg);
     if (room.chat.length > 50) room.chat.shift();
+    touch(room);
 
     io.to(roomCode).emit('new-chat', { chatMsg, room: getRoomState(roomCode) });
   });
@@ -548,42 +592,32 @@ io.on('connection', (socket) => {
         player.connected = false;
         io.to(roomCode).emit('player-disconnected', { playerId: socket.id, room: getRoomState(roomCode) });
         
-        // If host disconnects, assign new host
-        if (player.isHost && room.players.some(p => p.connected)) {
-          const newHost = room.players.find(p => p.connected);
+        // If host disconnects, hand host to another connected human (not a bot)
+        if (player.isHost) {
+          const newHost = room.players.find(p => p.connected && !p.isBot);
           if (newHost) {
             newHost.isHost = true;
             room.hostId = newHost.id;
             io.to(roomCode).emit('new-host', { hostId: newHost.id, room: getRoomState(roomCode) });
           }
         }
-        
-        // Clean up empty rooms after 5 minutes
-        if (!room.players.some(p => p.connected)) {
-          setTimeout(() => {
-            if (rooms[roomCode] && !rooms[roomCode].players.some(p => p.connected)) {
-              delete rooms[roomCode];
-            }
-          }, 300000);
+
+        // Mark when the room went human-less; the janitor reclaims it after a grace
+        // period (a bots-only room counts as empty, so it can no longer leak).
+        if (connectedHumans(room) === 0) {
+          room.emptySince = room.emptySince || Date.now();
         }
       }
     }
   });
 });
 
-function getBidIncrement(currentAmount) {
-  if (currentAmount < 0.50) return 0.05;
-  if (currentAmount < 1.00) return 0.10;
-  if (currentAmount < 5.00) return 0.25;
-  return 0.30;
-}
-
 function processAutoBids(roomCode, depth = 0) {
   const room = rooms[roomCode];
   if (!room || room.status !== 'auctioning' || !room.currentPlayer || depth > 5) return;
 
   const currentAmount = room.currentBid > 0 ? room.currentBid : room.currentPlayer.basePrice;
-  const increment = getBidIncrement(currentAmount);
+  const increment = getSport(room.settings.sport).increment(currentAmount);
   const nextBid = parseFloat((currentAmount + increment).toFixed(2));
 
   // Find auto-bidders who should bid
@@ -686,6 +720,7 @@ function startNewAuction(roomCode) {
   room.currentBidder = null;
   room.timer = room.settings.bidTimer;
   room.bidHistory = []; // Reset bid history for new player
+  touch(room);
   
   if (room.currentPlayer) {
     updatePlayerStatus(roomCode, room.currentPlayer.id, 'current');
@@ -797,8 +832,18 @@ function endAuction(roomCode) {
   io.to(roomCode).emit('auction-ended', { room: getRoomState(roomCode), rankings });
 }
 
+// Keep a single small instance alive through unexpected errors instead of
+// crashing every live room. We log loudly so issues are still visible; a
+// process manager (pm2) can still restart on truly fatal states.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 IPL 2026 Auction Server running on port ${PORT}`);
-  console.log(`📊 Loaded ${ipl2026Players.length} players`);
+  console.log(`🚀 Auction server running on port ${PORT}`);
+  console.log(`📊 Loaded ${ipl2026Players.length} cricket players`);
 });
