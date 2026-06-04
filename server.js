@@ -233,7 +233,6 @@ io.on('connection', (socket) => {
     const budget = clampInt(settings.budget, 10, 1000, sport.defaultBudget);
     const squadSize = clampInt(settings.squadSize, 5, 25, 11);
     const bidTimer = clampInt(settings.bidTimer, 3, 60, 15);
-    const botCount = clampInt(settings.botCount, 0, 9, 0);
     // Only accept a franchise that belongs to this sport.
     const hostFranchiseRaw = cleanStr(settings.franchise, 8);
     const hostFranchise = sport.franchises.includes(hostFranchiseRaw) ? hostFranchiseRaw : null;
@@ -286,27 +285,7 @@ io.on('connection', (socket) => {
     };
 
     socket.join(roomCode);
-    // Add AI bots if requested
-    if (botCount > 0) {
-      const usedNames = [hostNameClean];
-      for (let i = 0; i < botCount; i++) {
-        const botName = getBotName(usedNames);
-        usedNames.push(botName);
-        const franchises = sport.franchises;
-        rooms[roomCode].players.push({
-          id: `bot-${i}-${Date.now()}`,
-          name: botName,
-          isHost: false,
-          isBot: true,
-          franchise: franchises[Math.floor(Math.random() * franchises.length)],
-          budget: rooms[roomCode].settings.budget,
-          team: [],
-          spent: 0,
-          connected: true,
-          autoBid: { enabled: false, maxPrice: 0 }
-        });
-      }
-    }
+    // AI bots are disabled — rooms are human-only.
 
     socket.emit('room-created', { roomCode, room: getRoomState(roomCode) });
   });
@@ -374,53 +353,14 @@ io.on('connection', (socket) => {
     socket.to(roomCode).emit('player-joined', { player: newPlayer, room: getRoomState(roomCode) });
   });
 
-  // Add Bot (Host only)
-  socket.on('add-bot', ({ roomCode }) => {
-    const room = rooms[roomCode];
-    if (!room || room.hostId !== socket.id) return;
-    if (room.status !== 'waiting') {
-      socket.emit('error', { message: 'Can only add bots before auction starts!' });
-      return;
-    }
-    if (room.players.filter(p => p.connected).length >= 10) {
-      socket.emit('error', { message: 'Room is full!' });
-      return;
-    }
-    const usedNames = room.players.map(p => p.name);
-    const botName = getBotName(usedNames);
-    const franchises = getSport(room.settings.sport).franchises;
-    const bot = {
-      id: `bot-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-      name: botName,
-      isHost: false,
-      isBot: true,
-      franchise: franchises[Math.floor(Math.random() * franchises.length)],
-      budget: room.settings.budget,
-      team: [],
-      spent: 0,
-      connected: true,
-      autoBid: { enabled: false, maxPrice: 0 }
-    };
-    room.players.push(bot);
-    socket.emit('bot-added', { bot, room: getRoomState(roomCode) });
-    socket.to(roomCode).emit('bot-added', { bot, room: getRoomState(roomCode) });
-  });
-
-  // Remove Bot (Host only)
-  socket.on('remove-bot', ({ roomCode, botId }) => {
-    const room = rooms[roomCode];
-    if (!room || room.hostId !== socket.id) return;
-    if (room.status !== 'waiting') return;
-    room.players = room.players.filter(p => p.id !== botId);
-    io.to(roomCode).emit('bot-removed', { room: getRoomState(roomCode) });
-  });
+  // AI bots are disabled — add-bot / remove-bot handlers removed.
 
   // Start Auction
   socket.on('start-auction', ({ roomCode }) => {
     const room = rooms[roomCode];
     if (!room || room.hostId !== socket.id) return;
-    if (room.players.filter(p => p.connected && !p.isBot).length < 1) {
-      socket.emit('error', { message: 'Need at least 1 human player!' });
+    if (room.players.filter(p => p.connected && !p.isBot).length < 2) {
+      socket.emit('error', { message: 'Need at least 2 players to start the auction!' });
       return;
     }
 
